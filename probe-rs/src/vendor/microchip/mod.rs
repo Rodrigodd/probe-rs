@@ -13,6 +13,7 @@ use crate::{
         microchip::sequences::{
             atsam::{AtSAM, DsuDid},
             mec17xx::Mec172x,
+            pic32cm_pl::Pic32cmPl,
         },
     },
 };
@@ -58,6 +59,8 @@ impl Vendor for Microchip {
             || chip.name.starts_with("PIC32CX")
         {
             DebugSequence::Arm(AtSAM::create())
+        } else if chip.name.starts_with("PIC32CM") && chip.name.get(11..13) == Some("PL") {
+            DebugSequence::Arm(Pic32cmPl::create())
         } else if chip.name.starts_with("MEC172") {
             DebugSequence::Arm(Mec172x::create())
         } else {
