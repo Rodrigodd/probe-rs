@@ -237,9 +237,11 @@ fn try_detect_arm_chip(
                     let vendors = vendors();
                     for vendor in vendors.iter() {
                         // TODO: only consider families with matching JEP106.
-                        if let Some(target_name) =
-                            vendor.try_detect_arm_chip(registry, interface.as_mut(), found_chip)?
-                        {
+                        if let Some(target_name) = vendor.try_detect_arm_chip(
+                            registry,
+                            interface.as_mut(),
+                            found_chip.clone(),
+                        )? {
                             found_target = Some(registry.get_target_by_name(&target_name)?);
                             break;
                         }

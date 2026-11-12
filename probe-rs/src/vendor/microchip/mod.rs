@@ -6,7 +6,7 @@ use probe_rs_target::{Chip, chip_detection::ChipDetectionMethod};
 
 use crate::{
     Error,
-    architecture::arm::{ArmChipInfo, ArmDebugInterface, FullyQualifiedApAddress},
+    architecture::arm::{ArmChipInfo, ArmDebugInterface},
     config::{DebugSequence, Registry},
     vendor::{
         Vendor,
@@ -78,9 +78,7 @@ impl Vendor for Microchip {
             return Ok(None);
         }
 
-        // FIXME: This is a bit shaky but good enough for now.
-        let access_port = &FullyQualifiedApAddress::v1_with_default_dp(0);
-        let mut memory = interface.memory_interface(access_port)?;
+        let mut memory = interface.memory_interface(&chip_info.access_port)?;
 
         // DSUs with a family-specific DID address. These are tried first, so that the fixed
         // ATSAM DID address is not read on devices that have a different register there.
