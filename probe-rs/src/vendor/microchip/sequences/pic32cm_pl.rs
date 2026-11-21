@@ -293,28 +293,40 @@ impl Pic32cmPl {
         Ok(())
     }
 
-    /// Leave park mode with a breakpoint on the application's reset handler, and wait for the
-    /// core to halt there. If it does not, halt it wherever it is.
+    /// Read the application's reset handler, if the application can be started.
     ///
-    /// If the flash is erased, stay halted in park mode. There is no application to halt in, and
-    /// the boot ROM resets the device in a loop, with debug access level 0.
-    ///
-    /// Also stay in park mode if the reset vector is not a Thumb address in flash. The core
-    /// would fault on its first instruction, drop to debug access level 0, and the breakpoint
-    /// could not stop it, as breakpoints only match in the code region.
-    fn halt_in_flash(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+    /// Returns `None` if the flash is erased, or if the reset vector is not a Thumb address in
+    /// flash. Leaving park mode then makes the device drop to debug access level 0: with an
+    /// erased flash, the boot ROM resets the device in a loop, and with an invalid reset vector,
+    /// the core faults on its first instruction.
+    fn application_reset_handler(
+        memory: &mut dyn ArmMemoryInterface,
+    ) -> Result<Option<u32>, ArmError> {
         let reset_handler = memory.read_word_32(RESET_VECTOR)?;
         if reset_handler == 0xFFFF_FFFF {
-            tracing::debug!("PIC32CM-PL: the flash is erased, staying halted in the boot ROM");
-            return Ok(());
+            tracing::debug!("PIC32CM-PL: the flash is erased");
+            return Ok(None);
         }
         if reset_handler & 1 == 0 || !FLASH_RANGE.contains(&(reset_handler & !1)) {
             tracing::warn!(
-                "PIC32CM-PL: the reset vector {reset_handler:#010x} is not a valid reset \
-                 handler, staying halted in the boot ROM"
+                "PIC32CM-PL: the reset vector {reset_handler:#010x} is not a valid reset handler"
             );
-            return Ok(());
+            return Ok(None);
         }
+        Ok(Some(reset_handler))
+    }
+
+    /// Leave park mode with a breakpoint on the application's reset handler, and wait for the
+    /// core to halt there. If it does not, halt it wherever it is.
+    ///
+    /// If there is no application that can be started, stay halted in park mode. The breakpoint
+    /// could not stop an invalid reset handler either, as breakpoints only match in the code
+    /// region.
+    fn halt_in_flash(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+        let Some(reset_handler) = Self::application_reset_handler(memory)? else {
+            tracing::debug!("PIC32CM-PL: no application to start, staying halted in the boot ROM");
+            return Ok(());
+        };
         tracing::debug!("PIC32CM-PL: reset handler at {reset_handler:#010x}");
 
         let mut bp_ctrl = BpCtrl(0);
@@ -488,7 +500,9 @@ impl ArmDebugSequence for Pic32cmPl {
     /// ROM's park mode restores the configured access level. If DAL 0 is configured, the device
     /// is locked, and only a chip erase unlocks it.
     ///
-    /// The core is left halted, and starts the application when it resumes.
+    /// The core is left halted, and starts the application when it resumes. If there is no
+    /// application that can be started, the core stays halted in the boot ROM's park mode, as
+    /// leaving it would drop the debug access level to 0 again.
     fn debug_device_unlock(
         &self,
         interface: &mut dyn ArmDebugInterface,
@@ -511,6 +525,12 @@ impl ArmDebugSequence for Pic32cmPl {
         );
         let mut memory = Self::reset_and_reconnect(interface, default_ap)?;
         if Self::reset_to_park(&mut *memory)? != 0 {
+            if Self::application_reset_handler(&mut *memory)?.is_none() {
+                tracing::debug!(
+                    "PIC32CM-PL: no application to start, staying halted in the boot ROM"
+                );
+                return Ok(());
+            }
             // Running from park mode with BREXT set restarts the boot ROM, which drops the
             // debug access level again. With BREXT released, it starts the application.
             return Self::release_brext(&mut *memory);
