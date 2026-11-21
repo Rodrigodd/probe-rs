@@ -547,6 +547,32 @@ impl ArmDebugSequence for Pic32cmPl {
         Self::chip_erase(interface, default_ap)
     }
 
+    /// Ignore a failed core debug deconfiguration when the debug access level is 0.
+    ///
+    /// When the core resumes in park mode, the boot ROM restarts, and the device can drop to
+    /// debug access level 0 at any time during shutdown. The core debug registers then cannot
+    /// be accessed, and the boot ROM has already reset the debug state.
+    fn debug_core_stop(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        core_type: CoreType,
+    ) -> Result<(), ArmError> {
+        let result = self
+            .debug_core_stop_default(interface, core_type)
+            .and_then(|()| interface.flush());
+        let Err(error) = result else {
+            return Ok(());
+        };
+
+        if interface.read_word_32(DSU_DAL)? & 0x3 == 0 {
+            tracing::debug!(
+                "PIC32CM-PL: debug access level is 0, the core debug stop failed: {error}"
+            );
+            return Ok(());
+        }
+        Err(error)
+    }
+
     fn debug_erase_sequence(&self) -> Option<Arc<dyn DebugEraseSequence>> {
         Some(Self::create())
     }
