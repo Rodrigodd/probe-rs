@@ -14,11 +14,15 @@ use crate::{
     architecture::arm::{
         ArmDebugInterface, ArmError, FullyQualifiedApAddress, Pins,
         communication_interface::SwdSequence,
-        core::armv6m::{BpCompx, BpCtrl, Dhcsr},
+        core::{
+            armv6m::{BpCompx, BpCtrl, Dhcsr},
+            cortex_m,
+        },
         memory::ArmMemoryInterface,
         sequences::{ArmDebugSequence, ArmDebugSequenceError, DebugEraseSequence},
         traits::DebugPortWire,
     },
+    core::RegisterId,
     session::MissingPermissions,
     vendor::microchip::sequences::atsam::SwdSequenceShim,
 };
@@ -84,6 +88,15 @@ const ROMCFG_DAL2_DEFAULT: u32 = 0xFFFF_FF55;
 
 /// Address of the reset vector of the application in flash.
 const RESET_VECTOR: u64 = 0x0C00_0004;
+
+/// Address in SRAM of the idle loop the core runs when there is no application.
+const IDLE_LOOP: u32 = 0x2000_0000;
+/// Two `b .` instructions.
+const IDLE_LOOP_CODE: u32 = 0xE7FE_E7FE;
+
+/// DCRSR register selectors.
+const REGSEL_PC: u16 = 15;
+const REGSEL_CONTROL_PRIMASK: u16 = 0b10100;
 
 /// Flash range of the largest device in the family. A reset handler outside of it is not valid.
 const FLASH_RANGE: std::ops::Range<u32> = 0x0C00_0000..0x0C02_0000;
@@ -283,6 +296,29 @@ impl Pic32cmPl {
         Ok(())
     }
 
+    /// Point the halted core at an idle loop in SRAM, with interrupts masked.
+    ///
+    /// Used instead of park mode when there is no application to start. Running out of park
+    /// mode makes the boot ROM reset the device, and without an application it then resets in a
+    /// loop with debug access level 0, where the core cannot be accessed. The idle loop keeps
+    /// the device in park mode, accessible, also when the core is resumed.
+    fn idle_in_sram(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+        let reset_vector = memory.read_word_32(RESET_VECTOR)?;
+        if reset_vector != 0xFFFF_FFFF {
+            tracing::warn!(
+                "PIC32CM-PL: the reset vector {reset_vector:#010x} is not a valid reset handler, \
+                 the application cannot start"
+            );
+        }
+        tracing::debug!("PIC32CM-PL: no application to start, running an idle loop in SRAM");
+        memory.write_word_32(IDLE_LOOP as u64, IDLE_LOOP_CODE)?;
+        cortex_m::write_core_reg(memory, RegisterId(REGSEL_CONTROL_PRIMASK), 1)?;
+        cortex_m::write_core_reg(memory, RegisterId(REGSEL_PC), IDLE_LOOP)?;
+        // If the device resets later, for example after an application was flashed, the boot
+        // ROM starts the application instead of waiting for the debugger.
+        Self::release_brext(memory)
+    }
+
     /// Run the core.
     fn run(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
         let mut dhcsr = Dhcsr(0);
@@ -308,7 +344,7 @@ impl Pic32cmPl {
             return Ok(None);
         }
         if reset_handler & 1 == 0 || !FLASH_RANGE.contains(&(reset_handler & !1)) {
-            tracing::warn!(
+            tracing::debug!(
                 "PIC32CM-PL: the reset vector {reset_handler:#010x} is not a valid reset handler"
             );
             return Ok(None);
@@ -319,13 +355,12 @@ impl Pic32cmPl {
     /// Leave park mode with a breakpoint on the application's reset handler, and wait for the
     /// core to halt there. If it does not, halt it wherever it is.
     ///
-    /// If there is no application that can be started, stay halted in park mode. The breakpoint
-    /// could not stop an invalid reset handler either, as breakpoints only match in the code
-    /// region.
+    /// If there is no application that can be started, stay halted at the idle loop in SRAM
+    /// instead. The breakpoint could not stop an invalid reset handler either, as breakpoints
+    /// only match in the code region.
     fn halt_in_flash(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
         let Some(reset_handler) = Self::application_reset_handler(memory)? else {
-            tracing::debug!("PIC32CM-PL: no application to start, staying halted in the boot ROM");
-            return Ok(());
+            return Self::idle_in_sram(memory);
         };
         tracing::debug!("PIC32CM-PL: reset handler at {reset_handler:#010x}");
 
@@ -385,6 +420,9 @@ impl Pic32cmPl {
 
         if self.halt_after_reset.load(Ordering::Relaxed) {
             Self::halt_in_flash(memory)
+        } else if Self::application_reset_handler(memory)?.is_none() {
+            Self::idle_in_sram(memory)?;
+            Self::run(memory)
         } else {
             Self::release_brext(memory)?;
             Self::run(memory)
@@ -500,9 +538,13 @@ impl ArmDebugSequence for Pic32cmPl {
     /// ROM's park mode restores the configured access level. If DAL 0 is configured, the device
     /// is locked, and only a chip erase unlocks it.
     ///
+    /// Without a valid application, the device is also reset into park mode when the debug
+    /// access level is not 0: the boot ROM may be resetting in a loop, and only briefly restore
+    /// the access level on each boot.
+    ///
     /// The core is left halted, and starts the application when it resumes. If there is no
-    /// application that can be started, the core stays halted in the boot ROM's park mode, as
-    /// leaving it would drop the debug access level to 0 again.
+    /// application that can be started, the core is left halted at an idle loop in SRAM, as
+    /// leaving park mode would drop the debug access level to 0 again.
     fn debug_device_unlock(
         &self,
         interface: &mut dyn ArmDebugInterface,
@@ -512,24 +554,29 @@ impl ArmDebugSequence for Pic32cmPl {
         {
             let mut memory = interface.memory_interface(default_ap)?;
             if memory.read_word_32(DSU_DAL)? & 0x3 != 0 {
+                if memory.read_word_32(Dhcsr::get_mmio_address()).is_err() {
+                    tracing::warn!(
+                        "PIC32CM-PL: the core is not accessible, resetting into the boot ROM"
+                    );
+                } else if Self::application_reset_handler(&mut *memory)?.is_none() {
+                    tracing::debug!("PIC32CM-PL: no application, resetting into the boot ROM");
+                } else {
+                    return Ok(());
+                }
+            } else if memory.read_word_32(DSU_STATUSA)? & STATUSA_CRSTEXT != 0 {
+                // Connecting under reset: `reset_hardware_deassert` runs the boot ROM handshake.
                 return Ok(());
-            }
-            // Connecting under reset: `reset_hardware_deassert` runs the boot ROM handshake.
-            if memory.read_word_32(DSU_STATUSA)? & STATUSA_CRSTEXT != 0 {
-                return Ok(());
+            } else {
+                tracing::warn!(
+                    "PIC32CM-PL: debug access level is 0, resetting into the boot ROM to restore it"
+                );
             }
         }
 
-        tracing::warn!(
-            "PIC32CM-PL: debug access level is 0, resetting into the boot ROM to restore it"
-        );
         let mut memory = Self::reset_and_reconnect(interface, default_ap)?;
         if Self::reset_to_park(&mut *memory)? != 0 {
             if Self::application_reset_handler(&mut *memory)?.is_none() {
-                tracing::debug!(
-                    "PIC32CM-PL: no application to start, staying halted in the boot ROM"
-                );
-                return Ok(());
+                return Self::idle_in_sram(&mut *memory);
             }
             // Running from park mode with BREXT set restarts the boot ROM, which drops the
             // debug access level again. With BREXT released, it starts the application.
