@@ -85,6 +85,9 @@ const ROMCFG_DAL2_DEFAULT: u32 = 0xFFFF_FF55;
 /// Address of the reset vector of the application in flash.
 const RESET_VECTOR: u64 = 0x0C00_0004;
 
+/// Flash range of the largest device in the family. A reset handler outside of it is not valid.
+const FLASH_RANGE: std::ops::Range<u32> = 0x0C00_0000..0x0C02_0000;
+
 /// How long to wait for the boot ROM to answer a command.
 const BOOT_ROM_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long to wait for the boot ROM to erase the chip.
@@ -295,10 +298,21 @@ impl Pic32cmPl {
     ///
     /// If the flash is erased, stay halted in park mode. There is no application to halt in, and
     /// the boot ROM resets the device in a loop, with debug access level 0.
+    ///
+    /// Also stay in park mode if the reset vector is not a Thumb address in flash. The core
+    /// would fault on its first instruction, drop to debug access level 0, and the breakpoint
+    /// could not stop it, as breakpoints only match in the code region.
     fn halt_in_flash(memory: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
         let reset_handler = memory.read_word_32(RESET_VECTOR)?;
         if reset_handler == 0xFFFF_FFFF {
             tracing::debug!("PIC32CM-PL: the flash is erased, staying halted in the boot ROM");
+            return Ok(());
+        }
+        if reset_handler & 1 == 0 || !FLASH_RANGE.contains(&(reset_handler & !1)) {
+            tracing::warn!(
+                "PIC32CM-PL: the reset vector {reset_handler:#010x} is not a valid reset \
+                 handler, staying halted in the boot ROM"
+            );
             return Ok(());
         }
         tracing::debug!("PIC32CM-PL: reset handler at {reset_handler:#010x}");
