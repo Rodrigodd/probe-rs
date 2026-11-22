@@ -29,19 +29,19 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dsu_peek  # noqa: E402
+
 FLASH = 0x0C00_0000
 COUNTER = 0x2000_0100
 
-# Warning printed when a connection finds the device at debug access level 0.
-DAL0_WARNING = "debug access level is 0, resetting into the boot ROM"
+# Warning printed when a connection finds the core inaccessible with an application in flash,
+# which means the application faulted.
+FAULT_WARNING = "the application may have faulted"
 # Warning printed when the image in flash has an invalid reset vector.
 BAD_VECTOR_WARNING = "is not a valid reset handler"
-
-# Warning printed when the device is in a boot loop, with the debug access level briefly
-# restored.
-CORE_WARNING = "the core is not accessible, resetting into the boot ROM"
 # Warnings expected while the device runs the bad image.
-BAD_STATE = [DAL0_WARNING, BAD_VECTOR_WARNING, CORE_WARNING]
+BAD_STATE = [FAULT_WARNING, BAD_VECTOR_WARNING]
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -115,8 +115,8 @@ class Harness:
             )
         return out
 
-    def read_words(self, address, count, allow=()):
-        out = self.check("read", "b32", hex(address), str(count), allow=allow)
+    def read_words(self, address, count, allow=(), chip=True):
+        out = self.check("read", "b32", hex(address), str(count), allow=allow, chip=chip)
         words = []
         for line in out.splitlines():
             m = re.match(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{8}\s*)+)$", line.strip())
@@ -127,6 +127,14 @@ class Harness:
         return words
 
     # Device setup
+
+    def power_on_reset(self):
+        """Reset the device without the debugger, like a power cycle."""
+        dap = dsu_peek.Dap(dsu_peek.find_hidraw())
+        try:
+            dap.pulse_reset()
+        finally:
+            dap.close()
 
     def erase(self):
         # The device may still run the bad image of an earlier test.
@@ -210,6 +218,37 @@ def test_erased_reset_pin(h):
     h.assert_erased()
 
 
+def test_erased_power_on_autodetect(h):
+    # After a power cycle with an erased flash, the boot ROM resets the device in a loop, and
+    # reads during each reset return 0. Detection and connection must still work, silently.
+    h.erase()
+    for _ in range(5):
+        h.power_on_reset()
+        out = h.check("read", "b32", hex(FLASH), "1", chip=False)
+        if "ffffffff" not in out:
+            raise Failure(f"unexpected read:\n{out}")
+        h.assert_detected()
+
+
+def test_erased_power_on_with_chip(h):
+    h.erase()
+    for _ in range(3):
+        h.power_on_reset()
+        h.assert_erased()
+
+
+def test_running_app_power_on_autodetect(h):
+    # Detection must not reset a running application.
+    h.erase()
+    h.download("good", "--start")
+    h.power_on_reset()
+    before = h.read_words(COUNTER, 1)[0]
+    after = h.read_words(COUNTER, 1, chip=False)[0]
+    if after <= before:
+        raise Failure(f"the application was reset, counter {before:#x} -> {after:#x}")
+    h.assert_app_running()
+
+
 def test_erased_write_and_read_ram(h):
     h.erase()
     h.check("write", "b32", hex(0x2000_0400), "0x12345678")
@@ -249,8 +288,7 @@ def test_running_app_reset_pin(h):
     h.erase()
     h.download("good", "--start")
     h.check("reset", "--method", "pin")
-    # A plain reset without the debugger: the device may come up at debug access level 0.
-    h.assert_good_image(allow=[DAL0_WARNING])
+    h.assert_good_image()
     h.assert_app_running()
 
 
