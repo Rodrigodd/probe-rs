@@ -352,6 +352,62 @@ impl Pic32cmPl {
         Ok(Some(reset_handler))
     }
 
+    /// Read the debug access level.
+    fn debug_access_level(memory: &mut dyn ArmMemoryInterface) -> Result<u32, ArmError> {
+        Ok(memory.read_word_32(DSU_DAL)? & 0x3)
+    }
+
+    /// Whether the core can be accessed. When the boot ROM resets the device in a loop, the
+    /// debug access level is briefly restored on each boot, but the core stays inaccessible.
+    pub(crate) fn is_core_accessible(
+        memory: &mut dyn ArmMemoryInterface,
+    ) -> Result<bool, ArmError> {
+        Ok(Self::debug_access_level(memory)? != 0
+            && memory.read_word_32(Dhcsr::get_mmio_address()).is_ok())
+    }
+
+    /// Reset into the boot ROM's park mode, which restores the configured debug access level.
+    ///
+    /// The core is left halted, and starts the application when it resumes. If there is no
+    /// application that can be started, the core is left halted at an idle loop in SRAM, as
+    /// leaving park mode would drop the debug access level to 0 again.
+    ///
+    /// `was_inaccessible` tells that the core was not accessible before, to report why.
+    ///
+    /// Returns the debug access level after the reset, which is 0 if the device is locked.
+    pub(crate) fn restore_access(
+        interface: &mut dyn ArmDebugInterface,
+        ap: &FullyQualifiedApAddress,
+        was_inaccessible: bool,
+    ) -> Result<u32, ArmError> {
+        let mut memory = Self::reset_and_reconnect(interface, ap)?;
+        let dal = Self::reset_to_park(&mut *memory)?;
+        if dal == 0 {
+            return Ok(0);
+        }
+
+        if Self::application_reset_handler(&mut *memory)?.is_none() {
+            // Without an application, the boot ROM resets the device in a loop at debug access
+            // level 0, as after a power cycle with an erased flash. This is expected.
+            if was_inaccessible {
+                tracing::debug!("PIC32CM-PL: restored debug access, there is no application");
+            }
+            Self::idle_in_sram(&mut *memory)?;
+        } else {
+            if was_inaccessible {
+                tracing::warn!(
+                    "PIC32CM-PL: the core was not accessible with an application in flash, the \
+                     application may have faulted. Reset into the boot ROM to restore access"
+                );
+            }
+            // Running from park mode with BREXT set restarts the boot ROM, which drops the
+            // debug access level again. With BREXT released, it starts the application.
+            Self::release_brext(&mut *memory)?;
+        }
+
+        Ok(dal)
+    }
+
     /// Leave park mode with a breakpoint on the application's reset handler, and wait for the
     /// core to halt there. If it does not, halt it wherever it is.
     ///
@@ -531,58 +587,45 @@ impl Pic32cmPl {
 }
 
 impl ArmDebugSequence for Pic32cmPl {
-    /// Restore debug access when the debug access level is 0.
+    /// Restore debug access when the core is not accessible.
     ///
-    /// The device drops to DAL 0 when the boot ROM cannot start the application, or after the
-    /// application faults. Then only the DSU and flash are accessible. Resetting into the boot
-    /// ROM's park mode restores the configured access level. If DAL 0 is configured, the device
-    /// is locked, and only a chip erase unlocks it.
+    /// The device drops to DAL 0 when the boot ROM cannot start the application, for example
+    /// after a power cycle with an erased flash, or after the application faults. Then only the
+    /// DSU is accessible. The boot ROM then resets the device in a loop, and only briefly
+    /// restores the access level on each boot. Resetting into the boot ROM's park mode restores
+    /// the configured access level. If DAL 0 is configured, the device is locked, and only a chip
+    /// erase unlocks it.
     ///
-    /// Without a valid application, the device is also reset into park mode when the debug
-    /// access level is not 0: the boot ROM may be resetting in a loop, and only briefly restore
-    /// the access level on each boot.
-    ///
-    /// The core is left halted, and starts the application when it resumes. If there is no
-    /// application that can be started, the core is left halted at an idle loop in SRAM, as
-    /// leaving park mode would drop the debug access level to 0 again.
+    /// Without a valid application, the device is also reset into park mode when the core is
+    /// accessible, so the core can be resumed without leaving park mode.
     fn debug_device_unlock(
         &self,
         interface: &mut dyn ArmDebugInterface,
         default_ap: &FullyQualifiedApAddress,
         permissions: &Permissions,
     ) -> Result<(), ArmError> {
+        let mut inaccessible = false;
         {
             let mut memory = interface.memory_interface(default_ap)?;
-            if memory.read_word_32(DSU_DAL)? & 0x3 != 0 {
-                if memory.read_word_32(Dhcsr::get_mmio_address()).is_err() {
-                    tracing::warn!(
-                        "PIC32CM-PL: the core is not accessible, resetting into the boot ROM"
-                    );
-                } else if Self::application_reset_handler(&mut *memory)?.is_none() {
-                    tracing::debug!("PIC32CM-PL: no application, resetting into the boot ROM");
-                } else {
+            if Self::is_core_accessible(&mut *memory)? {
+                if Self::application_reset_handler(&mut *memory)?.is_some() {
                     return Ok(());
                 }
+                tracing::debug!("PIC32CM-PL: no application, resetting into the boot ROM");
             } else if memory.read_word_32(DSU_STATUSA)? & STATUSA_CRSTEXT != 0 {
                 // Connecting under reset: `reset_hardware_deassert` runs the boot ROM handshake.
                 return Ok(());
             } else {
-                tracing::warn!(
-                    "PIC32CM-PL: debug access level is 0, resetting into the boot ROM to restore it"
+                tracing::debug!(
+                    "PIC32CM-PL: the core is not accessible, resetting into the boot ROM"
                 );
+                inaccessible = true;
             }
         }
 
-        let mut memory = Self::reset_and_reconnect(interface, default_ap)?;
-        if Self::reset_to_park(&mut *memory)? != 0 {
-            if Self::application_reset_handler(&mut *memory)?.is_none() {
-                return Self::idle_in_sram(&mut *memory);
-            }
-            // Running from park mode with BREXT set restarts the boot ROM, which drops the
-            // debug access level again. With BREXT released, it starts the application.
-            return Self::release_brext(&mut *memory);
+        if Self::restore_access(interface, default_ap, inaccessible)? != 0 {
+            return Ok(());
         }
-        drop(memory);
 
         if let Err(MissingPermissions(permission)) = permissions.erase_all() {
             return Err(ArmError::MissingPermissions(format!(

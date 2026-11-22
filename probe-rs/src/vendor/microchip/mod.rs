@@ -1,12 +1,17 @@
 //! Microchip vendor support.
 
+use std::{thread, time::Duration};
+
 use bitfield::bitfield;
 use jep106::JEP106Code;
 use probe_rs_target::{Chip, chip_detection::ChipDetectionMethod};
 
 use crate::{
     Error,
-    architecture::arm::{ArmChipInfo, ArmDebugInterface},
+    architecture::arm::{
+        ArmChipInfo, ArmDebugInterface, ArmError, FullyQualifiedApAddress,
+        memory::ArmMemoryInterface,
+    },
     config::{DebugSequence, Registry},
     vendor::{
         Vendor,
@@ -45,6 +50,98 @@ bitfield! {
     fv, _ : 0;
 }
 
+fn is_pic32cm_pl(name: &str) -> bool {
+    name.starts_with("PIC32CM") && name.get(11..13) == Some("PL")
+}
+
+/// Read a DSU DID register.
+///
+/// The boot ROM of some devices resets them in a loop when there is no application, and reads
+/// during a reset, which lasts a few milliseconds, return 0. Those are retried after a while.
+fn read_dsu_did(
+    memory: &mut dyn ArmMemoryInterface,
+    address: u32,
+) -> Result<MicrochipDsuDid, ArmError> {
+    let mut value = memory.read_word_32(address.into())?;
+    for _ in 0..5 {
+        if value != 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+        value = memory.read_word_32(address.into())?;
+    }
+    Ok(MicrochipDsuDid(value))
+}
+
+/// Identify devices whose DSU has a family-specific DID address, with the PNMID/PNDID layout.
+///
+/// At debug access level 0, the PIC32CM-PL reads its PNDID as 0. If its core is not accessible,
+/// it is reset into the boot ROM to restore the access level first, if `restore_access` is set.
+fn detect_by_dsu_did(
+    registry: &Registry,
+    interface: &mut dyn ArmDebugInterface,
+    ap: &FullyQualifiedApAddress,
+    restore_access: bool,
+) -> Result<Option<String>, Error> {
+    let mut memory = interface.memory_interface(ap)?;
+
+    // These are tried before the fixed ATSAM DID address, which may hold a different register
+    // on these devices.
+    let mut did_cache: Vec<(u32, Option<MicrochipDsuDid>)> = vec![];
+    for family in registry.families() {
+        for info in family
+            .chip_detection
+            .iter()
+            .filter_map(ChipDetectionMethod::as_microchip_dsu_did)
+        {
+            let did = match did_cache.iter().find(|(a, _)| *a == info.did_address) {
+                Some((_, did)) => *did,
+                None => {
+                    let did = match read_dsu_did(&mut *memory, info.did_address) {
+                        Ok(did) => Some(did),
+                        Err(error) => {
+                            tracing::debug!(
+                                "Failed to read DSU DID at {:#010x}: {error}",
+                                info.did_address
+                            );
+                            None
+                        }
+                    };
+                    did_cache.push((info.did_address, did));
+                    did
+                }
+            };
+
+            let Some(did) = did else { continue };
+            if !did.fv() || info.pnmid != did.pnmid() as u8 {
+                continue;
+            }
+            let Some(variant) = info.variants.get(&(did.pndid() as u8)) else {
+                continue;
+            };
+
+            if is_pic32cm_pl(variant) && !Pic32cmPl::is_core_accessible(&mut *memory)? {
+                if !restore_access {
+                    tracing::debug!(
+                        "PIC32CM-PL: the device is locked, its variant cannot be identified"
+                    );
+                    return Ok(Some(variant.clone()));
+                }
+                drop(memory);
+                tracing::debug!(
+                    "PIC32CM-PL: the core is not accessible, resetting into the boot ROM"
+                );
+                Pic32cmPl::restore_access(interface, ap, true)?;
+                return detect_by_dsu_did(registry, interface, ap, false);
+            }
+
+            return Ok(Some(variant.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Microchip
 #[derive(docsplay::Display)]
 pub struct Microchip;
@@ -59,7 +156,7 @@ impl Vendor for Microchip {
             || chip.name.starts_with("PIC32CX")
         {
             DebugSequence::Arm(AtSAM::create())
-        } else if chip.name.starts_with("PIC32CM") && chip.name.get(11..13) == Some("PL") {
+        } else if is_pic32cm_pl(&chip.name) {
             DebugSequence::Arm(Pic32cmPl::create())
         } else if chip.name.starts_with("MEC172") {
             DebugSequence::Arm(Mec172x::create())
@@ -81,44 +178,12 @@ impl Vendor for Microchip {
             return Ok(None);
         }
 
-        let mut memory = interface.memory_interface(&chip_info.access_port)?;
-
-        // DSUs with a family-specific DID address. These are tried first, so that the fixed
-        // ATSAM DID address is not read on devices that have a different register there.
-        let mut did_cache: Vec<(u32, Option<MicrochipDsuDid>)> = vec![];
-        for family in registry.families() {
-            for info in family
-                .chip_detection
-                .iter()
-                .filter_map(ChipDetectionMethod::as_microchip_dsu_did)
-            {
-                let did = match did_cache.iter().find(|(a, _)| *a == info.did_address) {
-                    Some((_, did)) => *did,
-                    None => {
-                        let did = match memory.read_word_32(info.did_address.into()) {
-                            Ok(value) => Some(MicrochipDsuDid(value)),
-                            Err(error) => {
-                                tracing::debug!(
-                                    "Failed to read DSU DID at {:#010x}: {error}",
-                                    info.did_address
-                                );
-                                None
-                            }
-                        };
-                        did_cache.push((info.did_address, did));
-                        did
-                    }
-                };
-
-                let Some(did) = did else { continue };
-                if !did.fv() || info.pnmid != did.pnmid() as u8 {
-                    continue;
-                }
-                if let Some(variant) = info.variants.get(&(did.pndid() as u8)) {
-                    return Ok(Some(variant.clone()));
-                }
-            }
+        if let Some(variant) = detect_by_dsu_did(registry, interface, &chip_info.access_port, true)?
+        {
+            return Ok(Some(variant));
         }
+
+        let mut memory = interface.memory_interface(&chip_info.access_port)?;
 
         // This device has an Atmel DSU - Read and parse the DSU DID register
         let did = DsuDid(memory.read_word_32(DsuDid::ADDRESS)?);
