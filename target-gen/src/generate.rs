@@ -10,10 +10,15 @@ use probe_rs_target::{
     CoreType, GenericRegion, MemoryAccess, MemoryRegion, NvmRegion, RamRegion, RawFlashAlgorithm,
     RiscvCoreAccessOptions, TargetDescriptionSource, XtensaCoreAccessOptions, XtensaCoreProperties,
     XtensaWindowProperties,
+    chip_detection::{ChipDetectionMethod, MicrochipDsuDidDetection},
 };
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::{fs, io::Read, path::Path};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 pub enum Kind<'a, T>
 where
@@ -38,6 +43,38 @@ where
         };
 
         Ok(buffer)
+    }
+
+    /// Returns the path of the first file whose path ends with `suffix`, ignoring ASCII case.
+    fn find_file_ending_with(&self, suffix: &str) -> Option<PathBuf> {
+        let suffix = suffix.to_ascii_lowercase();
+        let matches = |path: &str| {
+            path.replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&suffix)
+        };
+
+        match self {
+            Kind::Archive(archive) => archive
+                .file_names()
+                .filter_map(Result::ok)
+                .find(|name| matches(name))
+                .map(|name| PathBuf::from(name.as_ref())),
+            Kind::Directory(dir) => {
+                let mut found = None;
+                walk_files(dir, &mut |path| {
+                    if found.is_none()
+                        && let Ok(relative) = path.strip_prefix(dir)
+                        && matches(&relative.to_string_lossy())
+                    {
+                        found = Some(relative.to_path_buf());
+                    }
+                    Ok(())
+                })
+                .ok()?;
+                found
+            }
+        }
     }
 }
 
@@ -166,7 +203,7 @@ where
         patch_memmap(&mut memory_map);
 
         family.variants.push(Chip {
-            name: device_name,
+            name: device_name.clone(),
             part: None,
             svd: None,
             documentation: HashMap::new(),
@@ -180,9 +217,131 @@ where
             default_binary_format: None,
             skip_reset_on_ram_boot: false,
         });
+
+        if let Some(did) = read_microchip_dsu_did(&device_name, &mut kind) {
+            add_microchip_dsu_did_detection(family, did, device_name);
+        }
     }
 
     Ok(())
+}
+
+/// The DSU DID register of a Microchip device, as described by its ATDF file.
+#[derive(Debug, PartialEq)]
+struct MicrochipDsuDid {
+    address: u32,
+    pnmid: u8,
+    pndid: u8,
+}
+
+/// Reads the DSU DID register address and value from the device's ATDF file, if the pack has one
+/// and the DID has the PNMID/PNDID layout.
+fn read_microchip_dsu_did<T>(device_name: &str, kind: &mut Kind<T>) -> Option<MicrochipDsuDid>
+where
+    T: std::io::Seek + std::io::Read,
+{
+    let path = kind.find_file_ending_with(&format!("atdf/{device_name}.atdf"))?;
+    let atdf = kind
+        .read_bytes(&path)
+        .inspect_err(|error| log::debug!("Failed to read {}: {error}", path.display()))
+        .ok()?;
+
+    let did = parse_microchip_dsu_did(&String::from_utf8_lossy(&atdf));
+    if did.is_none() {
+        log::debug!("No PNMID/PNDID DSU DID found in {}", path.display());
+    }
+    did
+}
+
+fn parse_microchip_dsu_did(atdf: &str) -> Option<MicrochipDsuDid> {
+    let document = roxmltree::Document::parse(atdf).ok()?;
+    let named = |node: &roxmltree::Node, tag: &str, name: &str| {
+        node.has_tag_name(tag) && node.attribute("name") == Some(name)
+    };
+    let hex = |value: &str| parse_int::parse::<u32>(value).ok();
+
+    // The DSU base address, from the device's module instance.
+    let dsu_base = document
+        .descendants()
+        .find(|n| named(n, "instance", "DSU"))?
+        .children()
+        .find(|n| n.has_tag_name("register-group"))?
+        .attribute("offset")
+        .and_then(hex)?;
+
+    // The DID register in the DSU module definition.
+    let did_register = document
+        .descendants()
+        .filter(|n| named(n, "module", "DSU"))
+        .flat_map(|n| n.descendants())
+        .find(|n| named(n, "register", "DID"))?;
+    let has_bitfield = |name| did_register.children().any(|n| named(&n, "bitfield", name));
+    if !has_bitfield("PNMID") || !has_bitfield("PNDID") {
+        return None;
+    }
+    let did_offset = did_register.attribute("offset").and_then(hex)?;
+
+    let did_value = document
+        .descendants()
+        .find(|n| named(n, "property-group", "SIGNATURES"))?
+        .children()
+        .find(|n| named(n, "property", "DSU_DID"))?
+        .attribute("value")
+        .and_then(hex)?;
+
+    Some(MicrochipDsuDid {
+        address: dsu_base.checked_add(did_offset)?,
+        pnmid: (did_value >> 20) as u8,
+        pndid: (did_value >> 12) as u8,
+    })
+}
+
+fn add_microchip_dsu_did_detection(
+    family: &mut ChipFamily,
+    did: MicrochipDsuDid,
+    device_name: String,
+) {
+    let existing = family
+        .chip_detection
+        .iter_mut()
+        .find_map(|method| match method {
+            ChipDetectionMethod::MicrochipDsuDid(detection)
+                if detection.did_address == did.address && detection.pnmid == did.pnmid =>
+            {
+                Some(detection)
+            }
+            _ => None,
+        });
+
+    let detection = match existing {
+        Some(detection) => detection,
+        None => {
+            family
+                .chip_detection
+                .push(ChipDetectionMethod::MicrochipDsuDid(
+                    MicrochipDsuDidDetection {
+                        did_address: did.address,
+                        pnmid: did.pnmid,
+                        variants: Default::default(),
+                    },
+                ));
+            let Some(ChipDetectionMethod::MicrochipDsuDid(detection)) =
+                family.chip_detection.last_mut()
+            else {
+                unreachable!()
+            };
+            detection
+        }
+    };
+
+    if let Some(other) = detection.variants.get(&did.pndid) {
+        log::warn!(
+            "{device_name} and {other} have the same DSU DID PNDID {:#x}, keeping {other}",
+            did.pndid
+        );
+    } else {
+        detection.variants.insert(did.pndid, device_name);
+    }
 }
 
 fn try_parse_vendor(vendor: Option<&str>) -> Option<JEP106Code> {
@@ -656,5 +815,54 @@ fn ensure_single_ram_region_is_executable(mem_map: &mut [MemoryRegion]) {
         && let Some(ref mut access) = ram_region.access
     {
         access.execute = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn atdf(did_bitfields: &str) -> String {
+        format!(
+            r#"<avr-tools-device-file>
+  <devices><device name="X"><peripherals>
+    <module name="DSU"><instance name="DSU">
+      <register-group name="DSU" name-in-module="DSU" offset="0x41002000"/>
+    </instance></module>
+  </peripherals>
+  <property-groups><property-group name="SIGNATURES">
+    <property name="DSU_DID" value="0x0BA02053"/>
+  </property-group></property-groups>
+  </device></devices>
+  <modules><module name="DSU"><register-group name="DSU">
+    <register name="DID" offset="0x120">{did_bitfields}</register>
+  </register-group></module></modules>
+</avr-tools-device-file>"#
+        )
+    }
+
+    #[test]
+    fn parse_pnmid_pndid_dsu_did() {
+        let did = parse_microchip_dsu_did(&atdf(
+            r#"<bitfield name="PNDID" mask="0xFF000"/><bitfield name="PNMID" mask="0xFF00000"/>"#,
+        ));
+
+        assert_eq!(
+            did,
+            Some(MicrochipDsuDid {
+                address: 0x41002120,
+                pnmid: 0xba,
+                pndid: 0x02,
+            })
+        );
+    }
+
+    #[test]
+    fn skip_atsam_dsu_did() {
+        let did = parse_microchip_dsu_did(&atdf(
+            r#"<bitfield name="DEVSEL" mask="0xFF"/><bitfield name="SERIES" mask="0x3F0000"/>"#,
+        ));
+
+        assert_eq!(did, None);
     }
 }
