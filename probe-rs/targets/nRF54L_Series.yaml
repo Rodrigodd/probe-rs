@@ -11,13 +11,28 @@ chip_detection:
   variant_address: 0xffc320
   part: 0x54b15
   variants:
-    0x41414242: nRF54L15 # QFN48, engineering B
+    0x41414142: nRF54LM20A
+  target: nRF54L15
 - !NordicFicrInfo
   part_address: 0xffc31c
   variant_address: 0xffc320
-  part: 0x54b15
-  variants:
-    0x41414142: nRF54LM20A
+  part: 0x54b10
+  target: nRF54L10
+- !NordicFicrInfo
+  part_address: 0xffc31c
+  variant_address: 0xffc320
+  part: 0x54b05
+  target: nRF54L05
+- !NordicFicrInfo
+  part_address: 0xffc31c
+  variant_address: 0xffc320
+  part: 0x54bc20a
+  target: nRF54LM20A
+- !NordicFicrInfo
+  part_address: 0xffc31c
+  variant_address: 0xffc320
+  part: 0x54bc20b
+  target: nRF54LM20B
 variants:
 - name: nRF54L15
   cores:
@@ -42,7 +57,76 @@ variants:
     - main
   flash_algorithms:
   - nRF54L15
+- name: nRF54L10
+  cores:
+  - name: main
+    type: armv8m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0xfd000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20030000
+    cores:
+    - main
+  flash_algorithms:
+  - nRF54L15
+- name: nRF54L05
+  cores:
+  - name: main
+    type: armv8m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x7d000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20018000
+    cores:
+    - main
+  flash_algorithms:
+  - nRF54L15
 - name: nRF54LM20A
+  cores:
+  - name: main
+    type: armv8m
+    core_access_options: !Arm
+      ap: !v1 0
+  memory_map:
+  - !Nvm
+    range:
+      start: 0x0
+      end: 0x1fd000
+    cores:
+    - main
+    access:
+      boot: true
+  - !Ram
+    range:
+      start: 0x20000000
+      end: 0x20080000
+    cores:
+    - main
+  flash_algorithms:
+  - nRF54LM20A
+- name: nRF54LM20B
   cores:
   - name: main
     type: armv8m
