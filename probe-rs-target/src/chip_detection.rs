@@ -200,9 +200,14 @@ pub struct NordicFicrDetection {
     pub part: u32,
 
     /// INFO.VARIANT => Target name.
+    #[serde(default)]
     #[serde(serialize_with = "hex_keys_indexmap")]
     #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
     pub variants: IndexMap<u32, String>,
+
+    /// The target name when INFO.VARIANT is not in `variants`.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 /// Infineon XMC4000 SCU chip detection information.

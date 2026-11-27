@@ -99,11 +99,11 @@ fn ficr_info_detect(
         }
 
         // Read the VARIANT register, if not already read
-        if let Some(variant) =
-            read_register_cached(register_values, memory_interface, spec.variant_address)
-        {
-            return spec.variants.get(&variant).cloned();
-        }
+        let variant = read_register_cached(register_values, memory_interface, spec.variant_address);
+
+        return variant
+            .and_then(|variant| spec.variants.get(&variant).cloned())
+            .or_else(|| spec.target.clone());
     }
 
     None
