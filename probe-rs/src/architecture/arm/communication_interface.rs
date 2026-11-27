@@ -3,7 +3,7 @@ use crate::{
     architecture::arm::{
         ApAddress, ArmError, DapAccess, FullyQualifiedApAddress, RegisterAddress, SwoAccess,
         SwoConfig,
-        ap::{self, AccessPortType},
+        ap::{self, AccessPortType, ApRegister},
         dp::{
             Ctrl, DPIDR, DebugPortId, DebugPortVersion, DpAccess, DpAddress, DpRegisterAddress,
             Select1, SelectV1, SelectV3,
@@ -134,7 +134,13 @@ pub fn read_chip_info_from_rom_table(
 ) -> Result<Option<ArmChipInfo>, ArmError> {
     for ap in probe.access_ports(dp)? {
         if let Ok(mut memory) = probe.memory_interface(&ap) {
-            let base_address = memory.base_address()?;
+            let base_address = match memory.base_address() {
+                Ok(base_address) => base_address,
+                Err(error) => match unflagged_base_address(&mut *memory, &ap) {
+                    Some(base_address) => base_address,
+                    None => return Err(error),
+                },
+            };
             let component = Component::try_parse(&mut *memory, base_address)?;
 
             if let Component::Class1RomTable(component_id, _) = component
@@ -149,6 +155,22 @@ pub fn read_chip_info_from_rom_table(
     }
 
     Ok(None)
+}
+
+/// The address in a BASE register whose present bit is clear.
+///
+/// The nRF54L15 clears the present bit, although its BASE register holds the address of its ROM
+/// table. The caller accepts the address only if a ROM table is found there.
+fn unflagged_base_address(
+    memory: &mut dyn ArmMemoryInterface,
+    ap: &FullyQualifiedApAddress,
+) -> Option<u64> {
+    let interface = memory.get_arm_debug_interface().ok()?;
+    let base = interface.read_raw_ap_register(ap, ap::BASE::ADDRESS).ok()?;
+    let base = ap::BASE::try_from(base).ok()?;
+
+    (base.Format() == ap::BaseAddrFormat::ADIv5 && base.BASEADDR() != 0)
+        .then(|| u64::from(base.BASEADDR()) << 12)
 }
 
 // TODO: Rename trait!
